@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         M365 Copilot Chat Exporter
-// @namespace    https://github.com/ingo/m365-copilot-chat-exporter
-// @version      4.4
+// @namespace    https://github.com/genkidama37/m365-copilot-chat-exporter
+// @version      4.5
 // @description  Export Microsoft 365 Copilot conversations as ChatGPT-compatible conversations.json
 // @license      MIT
-// @author       ingo
+// @author       ingo, genkidama37
 // @match        https://m365.cloud.microsoft/
 // @match        https://m365.cloud.microsoft/chat*
 // @match        https://microsoft365.com/chat*
@@ -36,12 +36,12 @@
     "AdsQuery",
   ]);
 
-  // ── Text sanitization ──────────────────────────────────────────────
+  // ── Text sanitization & Card Extractors ───────────────────────────
 
   /**
    * Sanitize text to ensure it doesn't contain problematic control characters
-   * that could break JSON encoding. Removes ASCII control characters (0-31)
-   * and replaces newlines/tabs with spaces to avoid JSON encoding issues.
+   * that could break JSON encoding. Preserves printable characters, newlines,
+   * carriage returns, and tabs for formatting.
    */
   function sanitizeText(text) {
     if (!text) return text;
@@ -51,21 +51,109 @@
       const code = text.charCodeAt(i);
       
       if (code === 0x2028 || code === 0x2029) {
-        // Replace Unicode line/paragraph separators with space
-        result += " ";
-      } else if (code >= 32) {
-        // Keep printable characters
+        // Replace Unicode line/paragraph separators with newline
+        result += "\n";
+      } else if (code >= 32 || code === 10 || code === 13 || code === 9) {
+        // Keep printable characters, newlines, carriage returns, and tabs
         result += char;
-      } else if (code === 10 || code === 13) {
-        // Replace newlines and carriage returns with space
-        result += " ";
-      } else if (code === 9) {
-        // Replace tabs with space
-        result += " ";
       }
       // Skip other control characters (0-8, 11-12, 14-31)
     }
     return result;
+  }
+
+  /**
+   * Recursively extract text from AdaptiveCard elements (TextBlock, RichTextBlock, etc.).
+   */
+  function extractAdaptiveCardText(card) {
+    if (!card) return "";
+    const parts = [];
+
+    function walk(node) {
+      if (!node) return;
+
+      if (node.type === "TextBlock" && node.text) {
+        parts.push(node.text);
+      } else if (node.type === "RichTextBlock" && Array.isArray(node.inlines)) {
+        const inlineText = node.inlines.map((i) => i.text || "").join("");
+        if (inlineText) parts.push(inlineText);
+      }
+
+      if (Array.isArray(node.body)) {
+        node.body.forEach(walk);
+      }
+      if (Array.isArray(node.items)) {
+        node.items.forEach(walk);
+      }
+      if (Array.isArray(node.columns)) {
+        node.columns.forEach((col) => {
+          if (Array.isArray(col.items)) col.items.forEach(walk);
+        });
+      }
+    }
+
+    walk(card);
+    return parts.join("\n\n").trim();
+  }
+
+  /**
+   * Format references/citations attached to Copilot bot responses.
+   */
+  function formatReferences(referencesObj) {
+    if (!referencesObj || typeof referencesObj !== "object") return "";
+    const entries = Object.entries(referencesObj);
+    if (entries.length === 0) return "";
+
+    const refLines = [];
+
+    for (const [key, ref] of entries) {
+      const link = ref.targetLink;
+      if (!link) continue;
+
+      let title = link;
+      let label = key;
+
+      if (ref.displayData?.content) {
+        try {
+          const parsed = JSON.parse(ref.displayData.content);
+          if (parsed.Title) title = parsed.Title;
+          else if (parsed.providerDisplayName) title = parsed.providerDisplayName;
+          if (parsed.label) label = parsed.label;
+        } catch {}
+      }
+
+      refLines.push(`- [${label}] [${title}](${link})`);
+    }
+
+    if (refLines.length === 0) return "";
+    return `\n\n#### References\n${refLines.join("\n")}`;
+  }
+
+  /**
+   * Extract complete message text, prioritizing text, then adaptiveCards,
+   * generated code, and citations.
+   */
+  function extractMessageText(msg) {
+    if (!msg) return "";
+    let text = msg.text || "";
+
+    if (!text.trim() && Array.isArray(msg.adaptiveCards) && msg.adaptiveCards.length > 0) {
+      const cardTexts = msg.adaptiveCards
+        .map(extractAdaptiveCardText)
+        .filter(Boolean);
+      text = cardTexts.join("\n\n").trim();
+    }
+
+    if (msg.messageType === "GeneratedCode" && msg.text && !text.includes(msg.text.slice(0, 30))) {
+      text = text ? `${text}\n\n${msg.text}` : msg.text;
+    }
+
+    if (msg.references) {
+      const refs = formatReferences(msg.references);
+      if (refs) text += refs;
+    }
+
+    return text;
   }
 
   // ── Date range helpers ──────────────────────────────────────────
@@ -639,7 +727,7 @@
 
       for (const msg of conv.messages) {
         const created = toUnixSeconds(msg.createdAt);
-        const text = sanitizeText(msg.text || "");
+        const text = sanitizeText(extractMessageText(msg));
 
         let role;
         if (msg.author === "user") {
@@ -650,6 +738,8 @@
         } else {
           continue;
         }
+
+        if (!text.trim()) continue;
 
         const nodeId = msg.messageId || crypto.randomUUID();
 
