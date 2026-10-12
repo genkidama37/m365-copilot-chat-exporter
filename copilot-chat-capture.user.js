@@ -189,25 +189,115 @@
     };
   }
 
+  const DEFAULT_CLIENT_ID = "c0ab8ce9-e9a0-42e7-b064-33d422df41f1";
+  const SYDNEY_SCOPE = "https://substrate.office.com/sydney/.default";
+
+  function findSydneyTokenEntry(clientId = DEFAULT_CLIENT_ID) {
+    // 1. Check MSAL token keys index
+    const tokenKeysRaw = localStorage.getItem(`msal.3.token.keys.${clientId}`);
+    if (tokenKeysRaw) {
+      try {
+        const tokenKeys = JSON.parse(tokenKeysRaw);
+        const sydneyKey = tokenKeys.accessToken?.find((t) => t.includes(SYDNEY_SCOPE));
+        if (sydneyKey) {
+          const val = localStorage.getItem(sydneyKey);
+          if (val) return { key: sydneyKey, raw: val };
+        }
+      } catch {}
+    }
+
+    // 2. Scan all localStorage keys for Sydney access token
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.includes("accesstoken") && k.includes(SYDNEY_SCOPE)) {
+        const val = localStorage.getItem(k);
+        if (val) return { key: k, raw: val };
+      }
+    }
+    return null;
+  }
+
   function getMsalIds() {
+    const clientId = DEFAULT_CLIENT_ID;
+
+    // Strategy 1: Read from standard MSAL account keys in localStorage
+    const accountKeysRaw =
+      localStorage.getItem("msal.3.account.keys") ||
+      localStorage.getItem("msal.account.keys");
+    if (accountKeysRaw) {
+      try {
+        const accountKeys = JSON.parse(accountKeysRaw);
+        if (Array.isArray(accountKeys) && accountKeys.length > 0) {
+          const parts = accountKeys[0].split("|");
+          const homeAccountId = parts[0];
+          const tenantId = parts[2] || (homeAccountId.includes(".") ? homeAccountId.split(".")[1] : "");
+          const localAccountId = homeAccountId.includes(".") ? homeAccountId.split(".")[0] : homeAccountId;
+          if (localAccountId && tenantId) {
+            return { localAccountId, tenantId, homeAccountId, clientId };
+          }
+        }
+      } catch {}
+    }
+
+    // Strategy 2: Extract IDs directly from the Sydney access token key in localStorage
+    const sydneyEntry = findSydneyTokenEntry(clientId);
+    if (sydneyEntry?.key) {
+      const uuidRegex = /[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/g;
+      const matches = sydneyEntry.key.match(uuidRegex);
+      if (matches && matches.length >= 3) {
+        return {
+          localAccountId: matches[0],
+          tenantId: matches[1],
+          homeAccountId: `${matches[0]}.${matches[1]}`,
+          clientId: matches[2] || clientId,
+        };
+      }
+    }
+
+    // Strategy 3: Fallback to DOM #identity element (if present in older builds)
     const el = document.getElementById("identity");
-    if (!el?.textContent) throw new Error("Missing #identity element in page");
-    const { objectId, tenantId } = JSON.parse(el.textContent);
-    return {
-      localAccountId: objectId,
-      tenantId,
-      homeAccountId: `${objectId}.${tenantId}`,
-      clientId: "c0ab8ce9-e9a0-42e7-b064-33d422df41f1",
-    };
+    if (el?.textContent) {
+      try {
+        const { objectId, tenantId } = JSON.parse(el.textContent);
+        if (objectId && tenantId) {
+          return {
+            localAccountId: objectId,
+            tenantId,
+            homeAccountId: `${objectId}.${tenantId}`,
+            clientId,
+          };
+        }
+      } catch {}
+    }
+
+    throw new Error(
+      "Could not detect Copilot user identity in localStorage. Make sure you are logged in at https://m365.cloud.microsoft/chat"
+    );
   }
 
   async function getAccessToken(msalIds) {
     const cookie = await getEncryptionCookie();
-    const { homeAccountId, tenantId, clientId } = msalIds;
-    const scopes = ["https://substrate.office.com/sydney/.default"];
-    const lsKey = `${homeAccountId}-login.windows.net-accesstoken-${clientId}-${tenantId}-${scopes.join(" ")}--`;
-    const stored = localStorage.getItem(lsKey);
-    if (!stored) throw new Error("Missing MSAL access token in localStorage");
+    const { clientId, homeAccountId, tenantId } = msalIds;
+
+    const sydneyEntry = findSydneyTokenEntry(clientId);
+    let stored = sydneyEntry?.raw;
+
+    if (!stored) {
+      const scopes = [SYDNEY_SCOPE];
+      const candidates = [
+        `${homeAccountId}-login.windows.net-accesstoken-${clientId}-${tenantId}-${scopes.join(" ")}--`,
+        `${homeAccountId}-login.microsoftonline.com-accesstoken-${clientId}-${tenantId}-${scopes.join(" ")}--`,
+      ];
+      for (const k of candidates) {
+        stored = localStorage.getItem(k);
+        if (stored) break;
+      }
+    }
+
+    if (!stored) {
+      throw new Error("Missing MSAL access token in localStorage. Try refreshing the page.");
+    }
+
     const payload = JSON.parse(stored);
     const decrypted = await decryptPayload(cookie.key, payload.nonce, clientId, payload.data);
     return JSON.parse(decrypted).secret;
